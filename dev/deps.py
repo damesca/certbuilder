@@ -75,14 +75,10 @@ def _download(url, dest):
         powershell_exe = os.path.join('system32\\WindowsPowerShell\\v1.0\\powershell.exe')
         code = "[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12;"
         code += "(New-Object Net.WebClient).DownloadFile('%s', '%s');" % (url, dest_path)
-        _execute([powershell_exe, '-Command', code], dest, 'Unable to connect to')
+        _execute([powershell_exe, '-Command', code], dest)
 
     else:
-        _execute(
-            ['curl', '-L', '--silent', '--show-error', '-O', url],
-            dest,
-            'Failed to connect to'
-        )
+        _execute(['curl', '-L', '--silent', '--show-error', '-O', url], dest)
 
     return dest_path
 
@@ -460,7 +456,7 @@ def _parse_requires(path):
     return packages
 
 
-def _execute(params, cwd, retry=None):
+def _execute(params, cwd):
     """
     Executes a subprocess
 
@@ -469,9 +465,6 @@ def _execute(params, cwd, retry=None):
 
     :param cwd:
         The working directory to execute the command in
-
-    :param retry:
-        If this string is present in stderr, retry the operation
 
     :return:
         A 2-element tuple of (stdout, stderr)
@@ -486,9 +479,7 @@ def _execute(params, cwd, retry=None):
     stdout, stderr = proc.communicate()
     code = proc.wait()
     if code != 0:
-        if retry and retry in stderr.decode('utf-8'):
-            return _execute(params, cwd)
-        e = OSError('subprocess exit code for "%s" was %d: %s' % (' '.join(params), code, stderr))
+        e = OSError('subprocess exit code was non-zero')
         e.stdout = stdout
         e.stderr = stderr
         raise e

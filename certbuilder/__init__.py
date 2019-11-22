@@ -12,7 +12,14 @@ from asn1crypto import x509, keys, core
 from asn1crypto.util import int_to_bytes, int_from_bytes, timezone
 from oscrypto import asymmetric, util
 
-from .version import __version__, __version_info__
+###
+from binascii import hexlify, unhexlify
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+import socket
+import requests
+import json
+###
 
 if sys.version_info < (3,):
     int_types = (int, long)  # noqa
@@ -24,12 +31,8 @@ else:
     byte_cls = bytes
 
 
-__all__ = [
-    '__version__',
-    '__version_info__',
-    'CertificateBuilder',
-    'pem_armor_certificate',
-]
+__version__ = '0.14.2'
+__version_info__ = (0, 14, 2)
 
 
 def _writer(func):
@@ -54,6 +57,14 @@ def pem_armor_certificate(certificate):
     """
 
     return asymmetric.dump_certificate(certificate)
+
+# Method to generate a key pair with MPC
+# args: None
+# return: a dictionary containing status and keyId
+def generate_pair_mpc(target):
+	r = requests.get(target)
+	response = dict(json.loads(r.text))
+	return response	
 
 
 class CertificateBuilder(object):
@@ -111,8 +122,11 @@ class CertificateBuilder(object):
             the certificate is being issued for
         """
 
+	# Modificar subject_public_key para que en vez de ser un PublicKeyInfo
+	# sea un UniversalString (El parametro se recibe como un string normal)
+
         self.subject = subject
-        self.subject_public_key = subject_public_key
+	self.subject_public_key = subject_public_key
         self.ca = False
 
         self._hash_algo = 'sha256'
@@ -804,13 +818,11 @@ class CertificateBuilder(object):
         """
         Validates the certificate information, constructs the ASN.1 structure
         and then signs it
-
         :param signing_private_key:
             An asn1crypto.keys.PrivateKeyInfo or oscrypto.asymmetric.PrivateKey
             object for the private key to sign the certificate with. If the key
             is self-signed, this should be the private key that matches the
             public key, otherwise it needs to be the issuer's private key.
-
         :return:
             An asn1crypto.x509.Certificate object of the newly signed
             certificate
@@ -918,6 +930,129 @@ class CertificateBuilder(object):
             signing_private_key = asymmetric.load_private_key(signing_private_key)
         signature = sign_func(signing_private_key, tbs_cert.dump(), self._hash_algo)
 
+        return x509.Certificate({
+            'tbs_certificate': tbs_cert,
+            'signature_algorithm': {
+                'algorithm': signature_algorithm_id
+            },
+            'signature_value': signature
+        })
+
+    def build_mpc(self, signing_private_key, orq_ip, orq_port):
+	"""
+        Validates the certificate information, constructs the ASN.1 structure
+        and then signs it with a mpc engine
+
+        :param signing_private_key:
+            An integer identifier for the private key to sign the certificate with.
+            This identifier permits the mpc engine to find the private key associated
+            with the public key exported in the key generation process
+	
+	:param orq_ip, orq_port
+	    Info to send requests to the orchestrator
+
+        :return:
+            An asn1crypto.x509.Certificate object of the newly signed
+            certificate
+        """
+
+	def rsa_mpc_sign(signing_private_key, tbs_cert_dump, hash_algo, orq_ip, orq_port):
+
+		# Calculate hash corresponding to tbs_cert_dump	[Only SHA256]	
+		digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
+		digest.update(tbs_cert_dump)
+		digest = hexlify(digest.finalize())
+		print("[Client] Hash: " + digest)
+		
+		# Send HTTP GET request to the orquestrator for signing
+		target = "http://" + orq_ip + ":" + orq_port + "/signMessage/" + str(signing_private_key) + "?message=" + str(digest)
+		r = requests.get(target)
+
+		response = dict(json.loads(r.text))
+		
+		# Sign format must be bytearray 
+		print("Firma: " + str(response["sign"]))		
+		firma = unhexlify(response["sign"])
+		return firma
+	
+
+        if self._self_signed is not True and self._issuer is None:
+            raise ValueError(_pretty_message(
+                '''
+                Certificate must be self-signed, or an issuer must be specified
+                '''
+            ))
+
+        if self._self_signed:
+            self._issuer = self._subject
+
+        if self._serial_number is None:
+            time_part = int_to_bytes(int(time.time()))
+            random_part = util.rand_bytes(4)
+            self._serial_number = int_from_bytes(time_part + random_part)
+
+        if self._begin_date is None:
+            self._begin_date = datetime.now(timezone.utc)
+
+        if self._end_date is None:
+            self._end_date = self._begin_date + timedelta(365)
+
+        if not self.ca:
+            for ca_only_extension in set(['policy_mappings', 'policy_constraints', 'inhibit_any_policy']):
+                if ca_only_extension in self._other_extensions:
+                    raise ValueError(_pretty_message(
+                        '''
+                        Extension %s is only valid for CA certificates
+                        ''',
+                        ca_only_extension
+                    ))
+	
+	# The algorith is forced to be 'rsa'
+	signature_algo = 'rsa'
+	
+	# Hash's algorithm limited to SHA256 (internally)
+        signature_algorithm_id = '%s_%s' % (self._hash_algo, signature_algo)
+
+        def _make_extension(name, value):
+            return {
+                'extn_id': name,
+                'critical': self._determine_critical(name),
+                'extn_value': value
+            }
+
+        extensions = []
+        for name in sorted(self._special_extensions):
+            value = getattr(self, '_%s' % name)
+            if name == 'ocsp_no_check':
+                value = core.Null() if value else None
+            if value is not None:
+                extensions.append(_make_extension(name, value))
+
+        for name in sorted(self._other_extensions.keys()):
+            extensions.append(_make_extension(name, self._other_extensions[name]))
+
+        tbs_cert = x509.TbsCertificate({
+            'version': 'v3',
+            'serial_number': self._serial_number,
+            'signature': {
+                'algorithm': signature_algorithm_id
+            },
+            'issuer': self._issuer,
+            'validity': {
+                'not_before': x509.Time(name='utc_time', value=self._begin_date),
+                'not_after': x509.Time(name='utc_time', value=self._end_date),
+            },
+            'subject': self._subject,
+            'subject_public_key_info': self._subject_public_key,
+            'extensions': extensions
+        })
+
+
+	# Function binding
+	sign_func = rsa_mpc_sign
+
+        signature = sign_func(signing_private_key, tbs_cert.dump(), self._hash_algo, orq_ip, orq_port)
+	
         return x509.Certificate({
             'tbs_certificate': tbs_cert,
             'signature_algorithm': {
